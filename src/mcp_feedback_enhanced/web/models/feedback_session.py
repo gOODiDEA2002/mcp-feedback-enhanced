@@ -470,14 +470,10 @@ class WebFeedbackSession:
             dict: 回饋結果
         """
         try:
-            # 使用比 MCP 超時稍短的時間（提前處理，避免邊界競爭）
-            # 對於短超時（<30秒），提前1秒；對於長超時，提前5秒
-            if timeout <= 30:
-                actual_timeout = max(timeout - 1, 5)  # 短超時提前1秒，最少5秒
-            else:
-                actual_timeout = timeout - 5  # 長超時提前5秒
+            # 直接使用用户设置的 timeout，不做调整
+            actual_timeout = timeout
             debug_log(
-                f"會話 {self.session_id} 開始等待回饋，超時時間: {actual_timeout} 秒（原始: {timeout} 秒）"
+                f"會話 {self.session_id} 開始等待回饋，超時時間: {actual_timeout} 秒"
             )
 
             loop = asyncio.get_event_loop()
@@ -609,6 +605,7 @@ class WebFeedbackSession:
         for img in images:
             try:
                 if not all(key in img for key in ["name", "data", "size"]):
+                    debug_log(f"圖片缺少必要字段: {list(img.keys())}")
                     continue
 
                 # 檢查文件大小（只有當限制大於0時才檢查）
@@ -618,18 +615,40 @@ class WebFeedbackSession:
                     )
                     continue
 
-                # 解碼 base64 數據
+                # 解碼 base64 數據，處理各種可能的格式
                 if isinstance(img["data"], str):
                     try:
-                        image_bytes = base64.b64decode(img["data"])
+                        # 移除可能的 data URL 前缀 (data:image/...;base64,)
+                        data_str = img["data"]
+                        if data_str.startswith('data:'):
+                            # 移除 data URL 前缀
+                            data_str = data_str.split(',', 1)[1] if ',' in data_str else data_str
+
+                        # 清理字符串：移除空白符
+                        data_str = data_str.strip().replace('\n', '').replace('\r', '').replace(' ', '')
+
+                        # Base64 解码
+                        image_bytes = base64.b64decode(data_str)
+                        debug_log(f"圖片 {img['name']} 从 base64 字符串解码成功，长度: {len(data_str)} -> {len(image_bytes)} bytes")
                     except Exception as e:
                         debug_log(f"圖片 {img['name']} base64 解碼失敗: {e}")
+                        debug_log(f"数据类型: {type(img['data'])}, 前100字符: {str(img['data'])[:100]}")
                         continue
-                else:
+                elif isinstance(img["data"], bytes):
+                    # 如果已经是 bytes，直接使用
                     image_bytes = img["data"]
+                    debug_log(f"圖片 {img['name']} 已是 bytes 格式，大小: {len(image_bytes)} bytes")
+                else:
+                    debug_log(f"圖片 {img['name']} 数据类型不支持: {type(img['data'])}")
+                    continue
 
                 if len(image_bytes) == 0:
                     debug_log(f"圖片 {img['name']} 數據為空，跳過")
+                    continue
+
+                # 验证图片数据是否有效（检查文件头）
+                if not self._validate_image_data(image_bytes, img['name']):
+                    debug_log(f"圖片 {img['name']} 数据验证失败，可能已损坏")
                     continue
 
                 processed_images.append(
@@ -645,10 +664,37 @@ class WebFeedbackSession:
                 )
 
             except Exception as e:
+                import traceback
                 debug_log(f"圖片處理錯誤: {e}")
+                debug_log(f"詳細錯誤: {traceback.format_exc()}")
                 continue
 
+        debug_log(f"圖片處理完成，成功: {len(processed_images)}/{len(images)}")
         return processed_images
+
+    def _validate_image_data(self, data: bytes, filename: str) -> bool:
+        """驗證圖片數據是否有效"""
+        if not data or len(data) < 8:
+            return False
+
+        # 檢查常見圖片格式的文件頭
+        image_signatures = {
+            b'\xFF\xD8\xFF': 'JPEG',
+            b'\x89PNG\r\n\x1a\n': 'PNG',
+            b'GIF87a': 'GIF',
+            b'GIF89a': 'GIF',
+            b'BM': 'BMP',
+            b'RIFF': 'WEBP'  # WEBP 文件以 RIFF 開始
+        }
+
+        for sig, format_name in image_signatures.items():
+            if data.startswith(sig):
+                debug_log(f"圖片 {filename} 驗證成功: {format_name} 格式")
+                return True
+
+        # 如果沒有匹配到已知的文件頭，記錄警告但仍然返回True（可能是其他格式）
+        debug_log(f"圖片 {filename} 未識別的文件頭: {data[:8].hex()}")
+        return True  # 仍然接受，讓後續處理決定
 
     def add_log(self, log_entry: str):
         """添加命令日誌"""
